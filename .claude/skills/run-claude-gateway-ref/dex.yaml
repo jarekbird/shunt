@@ -2,11 +2,12 @@
 # Throwaway dev fixture — the client secret and static password are
 # deliberately public dummy values, never used outside 127.0.0.1.
 #
-# Image MUST be pinned (driver uses ghcr.io/dexidp/dex:v2.44.0): the
-# `latest` (master) image hangs forever on grant_type=refresh_token —
+# Template rendered into the private run directory by driver.py.
+# Pin ghcr.io/dexidp/dex:v2.44.0 to reproduce the historical fixture: the
+# July 2026 `latest` (master) image hung on grant_type=refresh_token —
 # with BOTH memory and sqlite3 storage — so the gateway's session
 # refresh times out after its 3500ms budget (verified 2026-07-16).
-issuer: http://127.0.0.1:5556/dex
+issuer: http://127.0.0.1:@@DEX_PORT@@/dex
 storage:
   type: sqlite3
   config:
@@ -22,7 +23,7 @@ staticClients:
     redirectURIs:
       # The gateway builds its IdP callback as {public_url}/oauth/callback
       # (verified 2026-07-16 against claude gateway 2.1.211).
-      - http://127.0.0.1:8790/oauth/callback
+      - http://127.0.0.1:@@GATEWAY_PORT@@/oauth/callback
 enablePasswordDB: true
 staticPasswords:
   - email: dev@example.com
