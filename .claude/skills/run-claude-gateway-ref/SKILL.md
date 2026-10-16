@@ -1,46 +1,81 @@
 ---
 name: run-claude-gateway-ref
-description: Launch and drive a local reference Claude apps gateway (claude gateway + Dex + Postgres) to probe, capture, or re-verify the login / managed-settings / OTLP-telemetry wire protocol that shunt's gateway superset (login → managed/settings → telemetry, epic #87) must implement. Use to run the reference gateway, walk the device flow non-interactively, capture wire fixtures, or observe the telemetry relay.
+description: Capture the reference Claude gateway's device-login, managed-settings and telemetry protocol for comparison with Shunt, using isolated local Dex and PostgreSQL fixtures.
 ---
 
 # Run the reference Claude apps gateway (protocol probe)
 
 Spins up the **real** `claude gateway` (built into the `claude` binary) with a
 local Dex IdP and throwaway Postgres, then drives the full device-flow login
-**non-interactively with curl** — no browser needed. Use it to (re)capture the
+**non-interactively with Python HTTP requests** — no browser needed. Use it to (re)capture the
 wire contract shunt mirrors: exact token JSON, `/managed/settings` body, env
 push, OTLP relay behavior.
 
 Everything is driven by `.claude/skills/run-claude-gateway-ref/driver.sh`
-(paths relative to repo root). Backend note: curl is sufficient — the `/device`
-browser page is scriptable once you send same-origin CSRF headers.
+(paths relative to repo root). The `/device` browser leg uses same-origin CSRF
+headers and separate in-memory gateway and Dex cookie jars.
 
 ## Prerequisites
 
-- Docker running (pulls `postgres:16-alpine`, `ghcr.io/dexidp/dex:v2.44.0`)
-- `claude` binary ≥ 2.1.207 (verified with 2.1.211), `python3`, `curl`
-- Ports free: 8790 (gateway), 5556 (dex), 55432 (pg), 44318 (sink)
+- Docker running; the fixture uses `postgres:16-alpine` and `ghcr.io/dexidp/dex:v2.44.0`.
+- `claude`, Python 3.9+, and `lsof` on macOS/Linux.
+- The reference was exercised with Claude gateway 2.1.211 in July 2026. Confirm
+  the installed CLI still provides `claude gateway`; these historical captures
+  do not establish compatibility with newer versions.
 
-## Run (agent path)
+## Run
 
 ```bash
-S=.claude/skills/run-claude-gateway-ref/driver.sh
-$S up          # pg + dex containers, gateway on :8790, waits healthy
-$S sink-start  # optional: local OTLP sink so the telemetry relay is observable
-$S login       # full RFC 8628 device flow via curl → capture/token.json
-$S probe       # captures protocol.md, managed_settings.json (+304), models.json,
-               # refresh grant, POST /v1/metrics relay, /user/bootstrap
-$S status      # health of all three processes
-$S down        # kill gateway + sink, remove containers
+# On this server, put artifacts on the experiment volume.
+.claude/skills/run-claude-gateway-ref/driver.sh run \
+  --output-root /data/spark-bid/experiments/20261016-gateway-reference
 ```
 
-Artifacts land in `/tmp/shunt-gw-probe/capture/` (override root with
-`GWREF_WORK`). Gateway log: `/tmp/shunt-gw-probe/gateway.log` (audit events are
-JSON lines — `evt`: `device.authorize`, `device.verify`, `session.mint`,
-`session.refresh`, `managed.serve`, `auth.denied`). Sink log:
-`/tmp/shunt-gw-probe/sink.log`.
+On another host, use its private artifact directory. `GWREF_WORK` may supply the
+output root instead. Each invocation creates a fresh owner-only `gwref-*` run
+folder beneath it; it never reuses a prior capture directory. The default
+whole-run deadline is 180 seconds; `--timeout` accepts 30–1800 seconds, including
+image pulls and startup. Missing dependencies fail before resources are created.
 
-Login identity: `dev@example.com` / `password` (Dex static user, no groups).
+One foreground command starts unique, labelled PostgreSQL and Dex containers,
+a loopback telemetry sink, and the reference gateway; logs in as the synthetic
+Dex user; captures protocol/settings/models, refresh and bootstrap responses;
+and checks byte-identical telemetry delivery. It selects ephemeral loopback
+ports and renders the templates into the private run directory. The templates
+in this skill are not standalone configs.
+
+Cleanup runs on success, errors, timeout, Ctrl-C and SIGTERM: it reaps its own
+child and removes only containers whose ownership label matches this invocation.
+A competing gateway listener cannot satisfy readiness. Cleanup failure returns
+nonzero and names the resource needing inspection. No saved PID is later used
+as authority to kill a process. SIGKILL or a host crash can still leave a labelled
+container; inspect that run's ownership before removing it.
+
+This replaces the old detached `up`, `sink-start`, `login`, `probe`, `status` and
+`down` commands. Captures remain for inspection after all runtime resources close.
+Do not run an old `down` against unrelated processes or containers.
+
+The printed private run directory contains `capture/`, `gateway.log`, rendered
+configs, `reference-version.txt`, `run.json` and command diagnostics. Directories are mode 700; generated files are
+mode 600. Token responses and cookies are private data: do not print or commit
+them. Cookies remain in memory and cookie headers are omitted from captures;
+passwords, bearer/refresh tokens and HTTP request
+bodies are not passed as process arguments. The gateway gets an isolated
+`CLAUDE_CONFIG_DIR`; this probe does not write the user's CLI login state.
+
+Login identity: `dev@example.com` / `password` (synthetic Dex user, no groups).
+PostgreSQL and the gateway signing secret are generated per run. No inference
+request is made; the upstream API key is deliberately fake.
+
+## Offline regression checks
+
+```bash
+python3 -B .claude/skills/run-claude-gateway-ref/test_driver.py
+```
+
+These use local fake services and subprocesses; they do not start Docker,
+Claude, or a real provider session. Live reference compatibility must be checked
+separately when a protocol comparison is needed.
 
 ## Verified wire facts (2026-07-16, gateway 2.1.211)
 
@@ -77,7 +112,7 @@ Captured live; these fill the gaps `docs/gateway-protocol.md` marks unspecified:
   `device.verify result=csrf_rejected`.
 - **The `gw_dev` cookie from the `/device` POST must be replayed on
   `/oauth/callback`** or the device grant is never approved.
-- **Dex `latest` (master) hangs forever on refresh** (memory AND sqlite3
+- **The July 2026 Dex `latest` image hung on refresh** (memory AND sqlite3
   storage) → gateway `session.refresh` fails with "timed out after 3500ms" and
   the client gets `invalid_grant`. Pin `v2.44.0`.
 - Loopback OIDC issuer is rejected by the SSRF guard unless
@@ -90,9 +125,11 @@ Captured live; these fill the gaps `docs/gateway-protocol.md` marks unspecified:
 
 ## Troubleshooting
 
-- `refresh grant: 401` + gateway log "timed out after 3500ms" → your Dex image
-  is unpinned/master; `docker rm -f shunt-gw-dex` and rerun `up` (pulls v2.44.0).
-- `device POST did not redirect` from the driver → CSRF headers missing
-  (driver sends them; check you didn't proxy/strip them).
-- Boot fails on config: unknown keys fail fast with a field-level error; check
-  `/tmp/shunt-gw-probe/gateway.log` first.
+- A refresh failure with "timed out after 3500ms" matched an unpinned Dex image
+  in the July investigation. Keep the recorded version for reproduction; inspect
+  the private log before attributing a new failure to the same cause.
+- A failed device redirect can mean missing CSRF headers or a changed reference
+  flow. Inspect the version and private captures; the driver does not follow
+  redirects outside this run's gateway and Dex origins.
+- Boot fails on config: inspect `gateway.log` in the printed run directory.
+  Keep historical findings dated when updating templates for a newer reference.

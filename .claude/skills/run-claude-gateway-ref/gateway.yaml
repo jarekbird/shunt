@@ -2,27 +2,25 @@
 # Throwaway dev fixture — jwt_secret / client_secret / api_key are
 # deliberately fake dummy values, never used outside 127.0.0.1.
 #
-# Run (loopback issuer needs the SSRF-guard override):
-#   CLAUDE_GATEWAY_ALLOW_LOOPBACK=1 claude gateway --config gateway.yaml
-#
-# http:// public_url is accepted on loopback (verified 2.1.211).
+# Template rendered into the private run directory by driver.py.
+# http:// public_url was accepted on loopback in gateway 2.1.211 (July 2026).
 
 listen:
   host: 127.0.0.1
-  port: 8790
-  public_url: http://127.0.0.1:8790
+  port: @@GATEWAY_PORT@@
+  public_url: http://127.0.0.1:@@GATEWAY_PORT@@
 
 oidc:
-  issuer: http://127.0.0.1:5556/dex
+  issuer: http://127.0.0.1:@@DEX_PORT@@/dex
   client_id: claude-gateway
   client_secret: gateway-secret
 
 session:
-  jwt_secret: c2h1bnQtZ2F0ZXdheS1wcm9iZS1kZXYtc2VjcmV0LTAwMDE=
+  jwt_secret: @@JWT_SECRET@@
   ttl_hours: 1
 
 store:
-  postgres_url: postgres://postgres@127.0.0.1:55432/postgres
+  postgres_url: postgres://postgres:@@PG_PASSWORD@@@127.0.0.1:@@PG_PORT@@/postgres
 
 upstreams:
   - provider: anthropic
@@ -37,9 +35,9 @@ managed:
         env:
           DISABLE_UPDATES: "1"
 
-# Pointing at the driver's local sink (driver.sh sink-start) so the
+# Pointing at the driver's local sink so the
 # OTLP relay path can be observed. Configuring forward_to is also what
 # makes /managed/settings push the OTEL_* env block to clients.
 telemetry:
   forward_to:
-    - url: http://127.0.0.1:44318
+    - url: http://127.0.0.1:@@SINK_PORT@@
