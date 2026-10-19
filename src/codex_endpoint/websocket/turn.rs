@@ -1,7 +1,7 @@
 //! Per-turn forwarding for inbound Responses WebSocket sessions.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
@@ -13,26 +13,19 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::{
-    adapters::responses::codex_continuation::{build_transcript, decide, StoredContinuation},
     codex_endpoint::{forward_turn, pool_sticky_key},
     server::AppState,
 };
 
+use super::continuation::TurnRecorder;
 use crate::codex_endpoint::frame::{
     build_ws_error_frame, parse_payload_type, parse_sse_block, terminal_status_from_type,
     BoundedSseFrameBuffer, MAX_CLIENT_SSE_FRAME_BYTES,
 };
 
-/// Per-connection continuation captured from the last completed turn, so an
-/// incremental `response.create` frame (`previous_response_id` + input delta)
-/// can be expanded to the full input the HTTP upstream requires: the ChatGPT
-/// HTTP backend rejects `previous_response_id` outright
-/// (`Unsupported parameter: previous_response_id`), unlike the WebSocket
-/// backend the client is speaking. Lives only for one socket, like the
-/// client's own continuation state.
-pub(super) type SharedContinuation = Arc<Mutex<Option<StoredContinuation>>>;
-
 pub(super) struct TurnContext {
+    /// The runtime snapshot this turn routes with, refreshed by the caller
+    /// when the frame arrived.
     pub(super) state: AppState,
     pub(super) model: Option<String>,
     pub(super) session_id: Option<String>,
@@ -43,100 +36,9 @@ pub(super) struct TurnContext {
     pub(super) generation: u64,
     pub(super) current_generation: Arc<AtomicU64>,
     pub(super) out_tx: mpsc::Sender<(u64, Message)>,
-    pub(super) continuation: SharedContinuation,
-    /// The full logical input `body` carries after expansion, and the
-    /// signature of its non-input fields; recorded against the upstream
-    /// response so the next incremental frame can extend it.
-    pub(super) logical_input: Vec<serde_json::Value>,
-    pub(super) body_signature: String,
-}
-
-/// Prepare a `response.create` body for the HTTP upstream: drop
-/// `previous_response_id` (rejected there) and, when it names this
-/// connection's stored response, expand a delta-only `input` to the full
-/// transcript. A frame whose input already extends the transcript (the
-/// client sent the full history with the id as a hint) forwards unchanged
-/// apart from the dropped field. Returns the full logical input the
-/// prepared body carries.
-pub(super) fn prepare_body(
-    raw_json: &mut serde_json::Value,
-    continuation: &SharedContinuation,
-) -> Vec<serde_json::Value> {
-    let Some(obj) = raw_json.as_object_mut() else {
-        return Vec::new();
-    };
-    let previous = obj
-        .remove("previous_response_id")
-        .and_then(|value| value.as_str().map(ToOwned::to_owned));
-    let input = obj
-        .get("input")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let Some(previous) = previous else {
-        return input;
-    };
-    let stored = continuation.lock().ok().and_then(|guard| guard.clone());
-    let Some(stored) = stored.filter(|stored| stored.response_id == previous) else {
-        return input;
-    };
-    if decide(&stored, raw_json).is_some() {
-        return input;
-    }
-    let mut full = stored.transcript.clone();
-    full.extend(input.iter().cloned());
-    if let Some(obj) = raw_json.as_object_mut() {
-        obj.insert("input".to_string(), serde_json::Value::Array(full.clone()));
-    }
-    full
-}
-
-/// Record a terminal upstream event against the connection continuation: a
-/// completed response becomes the prefix the next incremental frame extends;
-/// a failed or incomplete one clears it, since the backend state the client
-/// would name no longer matches anything shunt can expand from.
-fn record_terminal(
-    continuation: &SharedContinuation,
-    logical_input: &[serde_json::Value],
-    body_signature: &str,
-    payload: &str,
-    terminal: crate::codex_endpoint::frame::TerminalStatus,
-) {
-    use crate::codex_endpoint::frame::TerminalStatus;
-    let Ok(mut guard) = continuation.lock() else {
-        return;
-    };
-    if terminal != TerminalStatus::Completed {
-        *guard = None;
-        return;
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-        *guard = None;
-        return;
-    };
-    let Some(response) = value.get("response") else {
-        *guard = None;
-        return;
-    };
-    let Some(id) = response.get("id").and_then(serde_json::Value::as_str) else {
-        *guard = None;
-        return;
-    };
-    if id.is_empty() {
-        *guard = None;
-        return;
-    }
-    let output = response
-        .get("output")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    *guard = Some(StoredContinuation {
-        response_id: id.to_string(),
-        signature: body_signature.to_string(),
-        transcript: build_transcript(logical_input, &output),
-        turn_state: None,
-    });
+    /// Records the upstream response against the connection continuation so
+    /// the next incremental frame can extend it.
+    pub(super) recorder: TurnRecorder,
 }
 
 /// The `(type, code, message)` for a non-success upstream body. The ChatGPT
@@ -177,16 +79,10 @@ pub(super) async fn run_turn(context: TurnContext) {
         generation: turn_gen,
         current_generation,
         out_tx,
-        continuation,
-        logical_input,
-        body_signature,
+        mut recorder,
     } = context;
     let is_current = || current_generation.load(Ordering::Relaxed) == turn_gen;
 
-    // A WebSocket connection may outlive several config reloads.  Refresh at
-    // turn start (rather than once at upgrade time) so each live turn captures
-    // one immutable runtime snapshot while later turns observe newer config.
-    let state = state.refreshed();
     let Some(codex_endpoint) = state.config.server.codex_endpoint.as_ref() else {
         let err_frame = build_ws_error_frame(
             502,
@@ -417,16 +313,8 @@ pub(super) async fn run_turn(context: TurnContext) {
                 }
             };
 
+            recorder.observe(&p_type, &payload);
             let terminal = terminal_status_from_type(&p_type);
-            if let Some(terminal) = terminal {
-                record_terminal(
-                    &continuation,
-                    &logical_input,
-                    &body_signature,
-                    &payload,
-                    terminal,
-                );
-            }
             let _ = out_tx.send((turn_gen, Message::Text(payload.into()))).await;
 
             if terminal.is_some() {
@@ -462,14 +350,8 @@ pub(super) async fn run_turn(context: TurnContext) {
                 if let Some(payload) = parse_sse_block(s) {
                     if payload != "[DONE]" {
                         if let Some(p_type) = parse_payload_type(&payload) {
-                            if let Some(terminal) = terminal_status_from_type(&p_type) {
-                                record_terminal(
-                                    &continuation,
-                                    &logical_input,
-                                    &body_signature,
-                                    &payload,
-                                    terminal,
-                                );
+                            recorder.observe(&p_type, &payload);
+                            if terminal_status_from_type(&p_type).is_some() {
                                 terminal_seen = true;
                             }
                             let _ = out_tx.send((turn_gen, Message::Text(payload.into()))).await;

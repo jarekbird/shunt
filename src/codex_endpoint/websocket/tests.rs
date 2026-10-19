@@ -159,3 +159,176 @@ fn unknown_previous_response_id_is_dropped_without_expansion() {
     assert!(frame.get("previous_response_id").is_none());
     assert_eq!(logical, vec![user_item("fresh")]);
 }
+
+fn assistant_item(text: &str) -> serde_json::Value {
+    json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
+}
+
+#[test]
+fn full_history_with_a_changed_setting_is_not_doubled() {
+    // A changed non-input field fails the continuation signature, but the
+    // input still carries the whole history, so it must not be prefixed with
+    // the stored transcript again.
+    let continuation = stored_after(vec![user_item("run pwd")], vec![assistant_item("ok")]);
+    let history = vec![
+        user_item("run pwd"),
+        assistant_item("ok"),
+        user_item("again"),
+    ];
+    let mut frame = json!({
+        "model": "gpt-6.1-sol", "stream": true,
+        "reasoning": {"effort": "high"},
+        "previous_response_id": "resp_1",
+        "input": history.clone(),
+    });
+
+    let logical = prepare_body(&mut frame, &continuation);
+
+    assert!(frame.get("previous_response_id").is_none());
+    assert_eq!(logical, history);
+    assert_eq!(frame["input"].as_array().unwrap(), &history);
+}
+
+#[test]
+fn full_history_equal_to_the_transcript_is_not_doubled() {
+    let continuation = stored_after(vec![user_item("run pwd")], vec![assistant_item("ok")]);
+    let history = vec![user_item("run pwd"), assistant_item("ok")];
+    let mut frame = json!({
+        "model": "gpt-6.1-sol", "stream": true,
+        "previous_response_id": "resp_1",
+        "input": history.clone(),
+    });
+
+    let logical = prepare_body(&mut frame, &continuation);
+
+    assert_eq!(logical, history);
+    assert_eq!(frame["input"].as_array().unwrap(), &history);
+}
+
+#[test]
+fn routed_frame_keeps_previous_response_id_and_its_delta() {
+    // A routed Responses API honours `previous_response_id` itself: the body
+    // is forwarded as sent, while the recorded logical input still carries
+    // the whole history.
+    let continuation = stored_after(vec![user_item("run pwd")], vec![assistant_item("ok")]);
+    let frame = json!({
+        "model": "glm-5.3", "stream": true,
+        "previous_response_id": "resp_1",
+        "input": [user_item("again")],
+    });
+    let sent = frame.clone();
+
+    let logical = routed_logical_input(&frame, &continuation);
+
+    assert_eq!(frame, sent);
+    assert_eq!(
+        logical,
+        vec![
+            user_item("run pwd"),
+            assistant_item("ok"),
+            user_item("again")
+        ]
+    );
+}
+
+#[test]
+fn only_routes_to_a_non_chatgpt_provider_keep_previous_response_id() {
+    use crate::config::{CodexEndpointConfig, CodexRouteConfig, Config};
+    let route = |model: &str, provider: &str| CodexRouteConfig {
+        model: model.to_string(),
+        provider: provider.to_string(),
+        upstream_model: None,
+    };
+    let mut config = Config::default();
+    config.server.codex_endpoint = Some(CodexEndpointConfig {
+        provider: "codex".to_string(),
+        routes: vec![route("glm-5.3", "openai"), route("pool-model", "codex")],
+    });
+
+    assert!(!targets_chatgpt_backend(&config, Some("glm-5.3")));
+    assert!(targets_chatgpt_backend(&config, Some("pool-model")));
+    assert!(targets_chatgpt_backend(&config, Some("gpt-6.1-sol")));
+    assert!(targets_chatgpt_backend(&config, None));
+}
+
+#[test]
+fn string_input_is_recorded_and_expanded_as_a_user_message() {
+    let continuation: SharedContinuation = Arc::new(std::sync::Mutex::new(None));
+    let mut first = json!({"model": "gpt-6.1-sol", "stream": true, "input": "run pwd"});
+
+    let logical = prepare_body(&mut first, &continuation);
+
+    // The wire body keeps the client's string; only the logical input is
+    // normalized.
+    assert_eq!(first["input"], "run pwd");
+    assert_eq!(logical, vec![user_item("run pwd")]);
+
+    let mut recorder = TurnRecorder::new(continuation.clone(), logical, signature(&first));
+    let completed = json!({
+        "type": "response.completed",
+        "response": {"id": "resp_1", "output": [assistant_item("/tmp")]},
+    })
+    .to_string();
+    recorder.observe("response.completed", &completed);
+
+    let mut delta = json!({
+        "model": "gpt-6.1-sol", "stream": true,
+        "previous_response_id": "resp_1",
+        "input": "again",
+    });
+    let logical = prepare_body(&mut delta, &continuation);
+
+    let expected = vec![
+        user_item("run pwd"),
+        assistant_item("/tmp"),
+        user_item("again"),
+    ];
+    assert_eq!(logical, expected);
+    assert_eq!(delta["input"].as_array().unwrap(), &expected);
+}
+
+#[test]
+fn recorder_captures_a_top_level_id_and_streamed_output_items() {
+    // `response.done` may carry its id at the top level and omit
+    // `response.output`; the items then come from `response.output_item.done`.
+    let continuation: SharedContinuation = Arc::new(std::sync::Mutex::new(None));
+    let mut recorder = TurnRecorder::new(
+        continuation.clone(),
+        vec![user_item("hi")],
+        "sig".to_string(),
+    );
+    let item_done = json!({
+        "type": "response.output_item.done",
+        "item": {"id": "msg_1", "type": "message", "role": "assistant", "content": []},
+    })
+    .to_string();
+    recorder.observe("response.output_item.done", &item_done);
+    let done = json!({"type": "response.done", "id": "resp_top"}).to_string();
+    recorder.observe("response.done", &done);
+
+    let stored = continuation.lock().unwrap().clone().expect("recorded");
+    assert_eq!(stored.response_id, "resp_top");
+    assert_eq!(
+        stored.transcript,
+        vec![
+            user_item("hi"),
+            json!({"id": "msg_1", "type": "message", "role": "assistant", "content": []}),
+        ]
+    );
+}
+
+#[test]
+fn recorder_clears_on_a_failed_terminal() {
+    let continuation = stored_after(vec![user_item("hi")], vec![]);
+    let mut recorder = TurnRecorder::new(continuation.clone(), Vec::new(), String::new());
+    recorder.observe(
+        "response.created",
+        &json!({"type": "response.created", "response": {"id": "resp_2"}}).to_string(),
+    );
+    recorder.observe(
+        "response.failed",
+        &json!({"type": "response.failed", "response": {"id": "resp_2"}}).to_string(),
+    );
+
+    assert!(continuation.lock().unwrap().is_none());
+}

@@ -97,10 +97,10 @@ session-sticky pool key, account selection, failover, refresh, and the OpenAI-sh
 verbatim to `<base_url>/codex/alpha/search` (`<base_url>/alpha/search` for a non-ChatGPT base),
 selected by `adapters::responses::CodexOperation`. Two things differ from a turn. A search is not a
 model turn, so `[[server.codex_endpoint.routes]]` never applies: it always goes to
-`[server.codex_endpoint].provider`, and it is labeled `web_search` in metrics and pool selection so
-no per-model cooldown recorded for a turn can block it. And the operation has no WebSocket form, so
-only `POST` is registered. Before these routes existed, every web search from a Codex CLI pointed at
-shunt failed with an empty `404`.
+`[server.codex_endpoint].provider`, and it is labeled `web_search` in metrics but selects its
+account without a model, so no per-model cooldown can block it. And the operation has no WebSocket
+form, so only `POST` is registered. Before these routes existed, every web search from a Codex CLI
+pointed at shunt failed with an empty `404`.
 
 In addition, shunt registers dedicated Codex model discovery routes:
 
@@ -356,6 +356,13 @@ configured provider sets the outbound `websocket = true`
   failures arrive as standalone `type: "error"` frames carrying only safe response metadata.
   Failures before the upgrade (missing client token, a handshake without valid upgrade headers,
   an endpoint disabled by reload) return the OpenAI Responses error shape over HTTP.
+  An incremental `response.create` frame (`previous_response_id` plus only the new input) is
+  expanded against the connection's own transcript — the previous turn's full input plus the
+  output items of its completed response — because the ChatGPT HTTP backend rejects
+  `previous_response_id`; the id is stripped only for turns served by a ChatGPT backend, and a
+  frame whose input already carries the whole history is forwarded without expansion. A turn
+  routed by `[[server.codex_endpoint.routes]]` to a non-ChatGPT provider receives the frame
+  unchanged, `previous_response_id` included.
 
 Without `[server.auth]`, a browser-originated upgrade is admitted only when its `Origin` matches
 the `Host` header. That check cannot tell `http` from `https` on the same host — shunt does not
