@@ -246,8 +246,7 @@ async fn handle_socket(
                         let admin_header_clone = admin_header.clone();
                         let out_tx_clone = out_tx.clone();
                         let gen_clone = current_generation.clone();
-                        let recorder =
-                            TurnRecorder::new(
+                        let recorder = TurnRecorder::new(
                             continuation.clone(),
                             target.provider,
                             logical_input,
