@@ -197,11 +197,17 @@ async fn forward_codex_passthrough(
     // translating outbound path: near-quota accounts rotate proactively and
     // available accounts order by burn-rate headroom (issue #195). The
     // passthrough body's model is a label only (no fable-scoped Codex window).
+    // A search's `web_search` label names no model, so it selects without one:
+    // a per-model cooldown that happens to share the label must not block it.
+    let selection_model = match operation {
+        CodexOperation::Responses => Some(route.upstream_model.as_str()),
+        CodexOperation::AlphaSearch => None,
+    };
     let (order, mut reprobe_reservation, cap) = state.accounts.select_order_deferred_with_cap(
         &route.provider,
         &accounts_config,
         pool_key.as_deref(),
-        Some(route.upstream_model.as_str()),
+        selection_model,
         state.config.server.pool.as_ref(),
     );
     let ramp_initial = state.config.storm_ramp_initial();

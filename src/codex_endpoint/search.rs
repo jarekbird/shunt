@@ -41,8 +41,10 @@ pub(crate) const PATHS: [&str; 3] = [
     "/v1/alpha/search",
 ];
 
-/// The metrics and pool-selection label of a search request. It names no
-/// model, so a per-model cooldown recorded for a turn never blocks a search.
+/// The metrics label of a search request. It names no model, so account
+/// selection for a search applies no per-model cooldown
+/// (`responses::forward_codex_inbound` selects without one for
+/// [`CodexOperation::AlphaSearch`]).
 const LABEL: &str = "web_search";
 
 /// Handler for the inbound web-search routes ([`PATHS`]).

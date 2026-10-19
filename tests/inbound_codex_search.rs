@@ -103,7 +103,11 @@ fn test_config(upstream_base_url: &str, accounts: Vec<AccountConfig>) -> Config 
     config
 }
 
-async fn start_gateway_with(mut config: Config) -> TestGateway {
+async fn start_gateway_with(config: Config) -> TestGateway {
+    start_gateway_with_state(config).await.0
+}
+
+async fn start_gateway_with_state(mut config: Config) -> (TestGateway, server::AppState) {
     config.server.bind = "127.0.0.1:0".to_string();
     let listener = tokio::net::TcpListener::bind(config.server.bind_addr().unwrap())
         .await
@@ -114,10 +118,13 @@ async fn start_gateway_with(mut config: Config) -> TestGateway {
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    TestGateway {
-        base_url: format!("http://{addr}"),
-        task,
-    }
+    (
+        TestGateway {
+            base_url: format!("http://{addr}"),
+            task,
+        },
+        state,
+    )
 }
 
 fn can_bind_loopback() -> bool {
@@ -254,7 +261,10 @@ async fn search_is_gated_by_inbound_auth_with_an_openai_shaped_error() {
 #[tokio::test]
 async fn a_rate_limited_account_fails_over_to_the_next_one() {
     // The relay reuses the pool's failover: a 429 from one account rotates the
-    // same search to the next account instead of failing the tool call.
+    // same search to the next account instead of failing the tool call. A
+    // session-less request on a fresh pool starts its round-robin at the first
+    // configured account, so the limited account is always tried first; its
+    // mock's `.expect(1)` and the healthy reply together prove the rotation.
     if !can_bind_loopback() {
         return;
     }
@@ -269,7 +279,7 @@ async fn a_rate_limited_account_fails_over_to_the_next_one() {
         .and(path("/codex/alpha/search"))
         .and(BearerToken(limited.clone()))
         .respond_with(ResponseTemplate::new(429).set_body_string(r#"{"error":"limited"}"#))
-        .expect(0..=1)
+        .expect(1)
         .mount(&upstream)
         .await;
     Mock::given(method("POST"))
@@ -294,6 +304,61 @@ async fn a_rate_limited_account_fails_over_to_the_next_one() {
     assert_eq!(
         response.headers().get("x-shunt-account").unwrap(),
         "account-healthy"
+    );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn a_model_cooldown_named_like_the_search_label_does_not_defer_a_search() {
+    // A search is labeled `web_search` in metrics but names no model, so a
+    // per-model cooldown recorded under that name (the key is client-supplied
+    // on the Responses route) must not reorder its account selection. The
+    // session-less request starts at the first configured account; selecting
+    // with the label as the model would defer it behind the second.
+    if !can_bind_loopback() {
+        return;
+    }
+    let first = chatgpt_token("acct-first");
+    let second = chatgpt_token("acct-second");
+    let mut vars = common::env_lock().await;
+    vars.set("SHUNT_TEST_SEARCH_COOLED_FIRST", &first);
+    vars.set("SHUNT_TEST_SEARCH_COOLED_SECOND", &second);
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/alpha/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    // An explicit identity keys this config and the pool's resolved copy of
+    // it to the same health entry.
+    let first_account = AccountConfig {
+        uuid: Some("acct-first".to_string()),
+        ..account("account-first", "SHUNT_TEST_SEARCH_COOLED_FIRST")
+    };
+    let (gateway, state) = start_gateway_with_state(test_config(
+        &upstream.uri(),
+        vec![
+            first_account.clone(),
+            account("account-second", "SHUNT_TEST_SEARCH_COOLED_SECOND"),
+        ],
+    ))
+    .await;
+    state.accounts.cooldown_model(
+        "codex",
+        &first_account,
+        "web_search",
+        std::time::Duration::from_secs(300),
+        "test",
+    );
+
+    let response = post_search(&gateway, "/alpha/search", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-shunt-account").unwrap(),
+        "account-first"
     );
     upstream.verify().await;
 }
