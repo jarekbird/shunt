@@ -29,7 +29,7 @@ use super::frame::{
     build_warmup_completion_frames, build_ws_error_frame, parse_client_frame, ClientFrame,
 };
 use continuation::{
-    prepare_body, routed_logical_input, targets_chatgpt_backend, SharedContinuation, TurnRecorder,
+    prepare_body, prepare_routed_body, resolve_target, SharedContinuation, TurnRecorder,
 };
 use turn::{run_turn, TurnContext};
 
@@ -217,13 +217,14 @@ async fn handle_socket(
                         // The ChatGPT HTTP upstream rejects `previous_response_id`, so
                         // an incremental frame's delta is expanded against this
                         // connection's stored transcript there; a routed Responses
-                        // API honours the id itself and gets the frame unchanged.
-                        let logical_input =
-                            if targets_chatgpt_backend(&turn_state.config, model.as_deref()) {
-                                prepare_body(&mut raw_json, &continuation)
-                            } else {
-                                routed_logical_input(&raw_json, &continuation)
-                            };
+                        // API honours an id it issued itself and gets the frame
+                        // unchanged.
+                        let target = resolve_target(&turn_state.config, model.as_deref());
+                        let logical_input = if target.chatgpt {
+                            prepare_body(&mut raw_json, &continuation)
+                        } else {
+                            prepare_routed_body(&mut raw_json, &continuation, &target.provider)
+                        };
                         let body_signature =
                             crate::adapters::responses::codex_continuation::signature(&raw_json);
                         let body_bytes = Bytes::from(serde_json::to_vec(&raw_json).unwrap_or_default());
@@ -246,7 +247,12 @@ async fn handle_socket(
                         let out_tx_clone = out_tx.clone();
                         let gen_clone = current_generation.clone();
                         let recorder =
-                            TurnRecorder::new(continuation.clone(), logical_input, body_signature);
+                            TurnRecorder::new(
+                            continuation.clone(),
+                            target.provider,
+                            logical_input,
+                            body_signature,
+                        );
 
                         active_turn_task = Some(tokio::spawn(async move {
                             run_turn(TurnContext {

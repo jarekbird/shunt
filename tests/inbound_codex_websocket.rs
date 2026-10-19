@@ -600,19 +600,24 @@ async fn routed_turn_keeps_previous_response_id_and_its_delta_input() {
     // routed to another Responses API, which honours the id itself, must
     // reach it unchanged — stripping the id there would drop earlier context.
     let mut env = common::env_lock().await;
-    let completed = |id: &str| {
-        Reply::Static {
+    let completed = |id: &str| Reply::Static {
         status: StatusCode::OK,
         content_type: "text/event-stream",
         body: format!(
-            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"output\":[]}}}}\n\n"
+            "data: {{\"type\":\"response.completed\",\
+             \"response\":{{\"id\":\"{id}\",\"output\":[]}}}}\n\n"
         ),
         headers: Vec::new(),
-    }
     };
     let (upstream, state) = start_upstream(vec![completed("resp_1"), completed("resp_2")]).await;
     let gateway = start_native_gateway(&upstream, "ROUTED_PREVIOUS", &mut env).await;
-    let user = |text: &str| serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]});
+    let user = |text: &str| {
+        serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        })
+    };
 
     let mut socket = connect(&gateway, "/v1/responses").await;
     for frame in [

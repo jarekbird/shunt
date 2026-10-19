@@ -360,9 +360,14 @@ configured provider sets the outbound `websocket = true`
   expanded against the connection's own transcript — the previous turn's full input plus the
   output items of its completed response — because the ChatGPT HTTP backend rejects
   `previous_response_id`; the id is stripped only for turns served by a ChatGPT backend, and a
-  frame whose input already carries the whole history is forwarded without expansion. A turn
-  routed by `[[server.codex_endpoint.routes]]` to a non-ChatGPT provider receives the frame
-  unchanged, `previous_response_id` included.
+  frame whose input already carries the whole history is forwarded without expansion. An id that
+  does not name this connection's last completed response is dropped and the input forwarded as
+  sent: without a transcript shunt cannot tell a delta from a full history, so a client that sends
+  only a delta then loses the earlier context (e.g. after a reconnect) — resend the full history
+  on a new connection. A turn routed by `[[server.codex_endpoint.routes]]` to a non-ChatGPT
+  provider receives the frame unchanged, `previous_response_id` included, when that provider
+  issued the id (or shunt does not know it); an id issued by a different backend on the same
+  connection cannot resolve there, so it is stripped and the delta expanded instead.
 
 Without `[server.auth]`, a browser-originated upgrade is admitted only when its `Origin` matches
 the `Host` header. That check cannot tell `http` from `https` on the same host — shunt does not
